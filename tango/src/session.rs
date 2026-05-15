@@ -50,22 +50,6 @@ impl PvP {
 
 pub struct SinglePlayer {}
 
-/// mgba snapshot captured during replay playback, used by backward seek to
-/// skip the boot/menu sequence (and any rounds + frames before this point).
-/// Captured both at round-start (`has_committed_this_round = false`,
-/// `current_tick_in_round = 0`) and periodically mid-round.
-#[derive(Clone)]
-struct ReplaySnapshot {
-    checkpoint: tango_pvp::stepper::ReplayCheckpoint,
-    mgba_state: Box<mgba::state::State>,
-    /// Shadow-side state captured at the same instant. Replay-via-shadow
-    /// playback drives a second mgba core (the shadow) in lockstep with
-    /// the stepper to re-derive each tick's remote packet; restoring only
-    /// the stepper would leave the shadow at a stale tick and feed wrong
-    /// packets through the subsequent apply_input chain.
-    shadow_snapshot: tango_pvp::shadow::ShadowSnapshot,
-}
-
 /// Take a fresh snapshot every this many absolute_ticks within an active
 /// round, in addition to the round-start snapshot. Coarser snapshots leave
 /// long fast-forwards on backward scrub; finer snapshots cost RAM and a
@@ -90,7 +74,7 @@ pub struct Replayer {
     /// starts and periodic mid-round) and during sync seeks. Both seek
     /// directions pick the snapshot closest to target to minimize how
     /// many frames we have to re-run.
-    snapshots: Arc<parking_lot::Mutex<Vec<ReplaySnapshot>>>,
+    snapshots: Arc<parking_lot::Mutex<Vec<tango_pvp::stepper::ReplaySnapshot>>>,
     /// Furthest absolute_tick the background prefetch worker has reached.
     /// The seek-bar UI clamps user drags to this value so the user can
     /// only seek into prefetched (= snapshotted) territory.
@@ -102,7 +86,7 @@ pub struct Replayer {
 impl Replayer {
     /// Returns the snapshot whose `absolute_tick` is the largest value still
     /// `<= target`, if any.
-    fn best_snapshot_for(&self, target: u32) -> Option<ReplaySnapshot> {
+    fn best_snapshot_for(&self, target: u32) -> Option<tango_pvp::stepper::ReplaySnapshot> {
         self.snapshots
             .lock()
             .iter()
@@ -128,7 +112,7 @@ impl Prefetcher {
         replay: Arc<tango_pvp::replay::Replay>,
         game: &'static (dyn game::Game + Send + Sync),
         remote_game: &'static (dyn game::Game + Send + Sync),
-        snapshots: Arc<parking_lot::Mutex<Vec<ReplaySnapshot>>>,
+        snapshots: Arc<parking_lot::Mutex<Vec<tango_pvp::stepper::ReplaySnapshot>>>,
         progress: Arc<std::sync::atomic::AtomicU32>,
     ) -> Self {
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -161,7 +145,7 @@ fn run_prefetch(
     replay: Arc<tango_pvp::replay::Replay>,
     game: &'static (dyn game::Game + Send + Sync),
     remote_game: &'static (dyn game::Game + Send + Sync),
-    snapshots: Arc<parking_lot::Mutex<Vec<ReplaySnapshot>>>,
+    snapshots: Arc<parking_lot::Mutex<Vec<tango_pvp::stepper::ReplaySnapshot>>>,
     cancel: Arc<std::sync::atomic::AtomicBool>,
     progress: Arc<std::sync::atomic::AtomicU32>,
 ) -> anyhow::Result<()> {
@@ -242,7 +226,7 @@ fn run_prefetch(
             if want_round_start || want_mid_round {
                 if let Ok(state) = core.as_mut().save_state() {
                     if let Ok(shadow_snapshot) = shadow.lock().save_state() {
-                        snaps.push(ReplaySnapshot {
+                        snaps.push(tango_pvp::stepper::ReplaySnapshot {
                             checkpoint: cp,
                             mgba_state: state,
                             shadow_snapshot,
@@ -741,7 +725,7 @@ impl Session {
 
         let thread = mgba::thread::Thread::new(core);
 
-        let snapshots: Arc<parking_lot::Mutex<Vec<ReplaySnapshot>>> = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let snapshots: Arc<parking_lot::Mutex<Vec<tango_pvp::stepper::ReplaySnapshot>>> = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let prefetch_progress = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let prefetcher = Prefetcher::spawn(
             rom.clone(),
@@ -819,7 +803,7 @@ impl Session {
                             // stepper, and the apply_input chain would
                             // then feed misaligned packets.
                             if let Ok(shadow_snapshot) = shadow.lock().save_state() {
-                                snaps.push(ReplaySnapshot {
+                                snaps.push(tango_pvp::stepper::ReplaySnapshot {
                                     checkpoint: cp,
                                     mgba_state: state,
                                     shadow_snapshot,
@@ -959,7 +943,7 @@ impl Session {
             return Ok(false);
         }
 
-        let start_snap: Option<ReplaySnapshot> = if target < current {
+        let start_snap: Option<tango_pvp::stepper::ReplaySnapshot> = if target < current {
             r.best_snapshot_for(target)
         } else {
             r.snapshots
@@ -1023,7 +1007,7 @@ impl Session {
                         if !exists {
                             if let Ok(state) = core.save_state() {
                                 if let Ok(shadow_snapshot) = shadow.lock().save_state() {
-                                    snaps.push(ReplaySnapshot {
+                                    snaps.push(tango_pvp::stepper::ReplaySnapshot {
                                         checkpoint: cp,
                                         mgba_state: state,
                                         shadow_snapshot,

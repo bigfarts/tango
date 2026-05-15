@@ -623,6 +623,18 @@ pub struct ReplayCheckpoint {
     pub inputs_consumed: u32,
 }
 
+/// Full replay-playback snapshot. Bundles the stepper's [`ReplayCheckpoint`]
+/// with the matching stepper-core `mgba::state::State` and the shadow side's
+/// [`shadow::ShadowSnapshot`] so a single load restores both cores together.
+/// Restoring only the stepper would leave the shadow at its pre-seek tick
+/// and feed misaligned packets through the subsequent apply_input chain.
+#[derive(Clone)]
+pub struct ReplaySnapshot {
+    pub checkpoint: ReplayCheckpoint,
+    pub mgba_state: Box<mgba::state::State>,
+    pub shadow_snapshot: crate::shadow::ShadowSnapshot,
+}
+
 /// Shared handle to the [`InnerState`]. Per-game traps clone this and lock
 /// it inside their closures via [`State::lock_inner`].
 #[derive(Clone)]

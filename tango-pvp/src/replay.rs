@@ -4,7 +4,7 @@ mod protos;
 use byteorder::ReadBytesExt;
 use byteorder::WriteBytesExt;
 use prost::Message;
-use std::io::Write;
+use std::io::{Read, Write};
 
 pub use protos::replay11::metadata;
 pub type Metadata = protos::replay11::Metadata;
@@ -68,17 +68,23 @@ pub fn read_metadata(r: &mut impl std::io::Read) -> Result<Metadata, std::io::Er
     decode_metadata(version, &raw)
 }
 
-fn read_compressed_blob(r: &mut impl std::io::Read) -> std::io::Result<Vec<u8>> {
-    let len = r.read_u32::<byteorder::LittleEndian>()? as usize;
-    let mut compressed = vec![0u8; len];
-    r.read_exact(&mut compressed)?;
-    zstd::stream::decode_all(&compressed[..])
+// The local and remote SRAMs are stored as two zstd frames concatenated
+// directly in the stream — no length prefixes. `single_frame` + BufRead's
+// exact-consumption semantics leave the reader positioned right after the
+// frame's end marker, so the next zstd frame (and the joyflag records that
+// follow it) are read straight from the same reader.
+fn read_zstd_frame(r: &mut impl std::io::BufRead) -> std::io::Result<Vec<u8>> {
+    let mut decoder = zstd::stream::read::Decoder::with_buffer(r)?.single_frame();
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out)?;
+    Ok(out)
 }
 
-fn write_compressed_blob(w: &mut impl Write, data: &[u8]) -> std::io::Result<()> {
-    let compressed = zstd::stream::encode_all(data, 3)?;
-    w.write_u32::<byteorder::LittleEndian>(compressed.len() as u32)?;
-    w.write_all(&compressed)
+fn write_zstd_frame(w: impl Write, data: &[u8]) -> std::io::Result<()> {
+    let mut encoder = zstd::stream::write::Encoder::new(w, 3)?;
+    encoder.write_all(data)?;
+    encoder.finish()?;
+    Ok(())
 }
 
 impl Replay {
@@ -99,7 +105,8 @@ impl Replay {
         self.rounds.iter().map(|r| r.len()).sum()
     }
 
-    pub fn decode(mut r: impl std::io::Read) -> std::io::Result<Self> {
+    pub fn decode(r: impl std::io::Read) -> std::io::Result<Self> {
+        let mut r = std::io::BufReader::new(r);
         let metadata = read_metadata(&mut r)?;
 
         let is_offerer = r.read_u8()? != 0;
@@ -108,8 +115,8 @@ impl Replay {
         let mut rng_seed = [0u8; 16];
         r.read_exact(&mut rng_seed)?;
 
-        let local_sram = read_compressed_blob(&mut r)?;
-        let remote_sram = read_compressed_blob(&mut r)?;
+        let local_sram = read_zstd_frame(&mut r)?;
+        let remote_sram = read_zstd_frame(&mut r)?;
 
         // Streaming round decode: each record is `(p1_jf u16, p2_jf u16)`.
         // The first record of each round has `ROUND_START_FLAG` set in
@@ -190,8 +197,8 @@ impl Writer {
         writer.write_u8(if is_offerer { 1 } else { 0 })?;
         writer.write_u8(local_player_index)?;
         writer.write_all(&rng_seed)?;
-        write_compressed_blob(&mut writer, local_sram)?;
-        write_compressed_blob(&mut writer, remote_sram)?;
+        write_zstd_frame(&mut *writer, local_sram)?;
+        write_zstd_frame(&mut *writer, remote_sram)?;
         writer.flush()?;
         Ok(Writer {
             writer,
